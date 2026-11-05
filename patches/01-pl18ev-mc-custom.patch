@@ -1,0 +1,987 @@
+diff --git a/radio/src/edgetx.cpp b/radio/src/edgetx.cpp
+index d1c3b7e..ab790ee 100644
+--- a/radio/src/edgetx.cpp
++++ b/radio/src/edgetx.cpp
+@@ -181,6 +181,13 @@ void per10ms()
+ 
+   g_tmr10ms++;
+ 
++#if defined(MC_CUSTOM_BUILD) && !defined(SIMU)
++  {
++    extern void mcChargeTick();
++    mcChargeTick();
++  }
++#endif
++
+ #if defined(GUI)
+   if (lightOffCounter) lightOffCounter--;
+   if (flashCounter) flashCounter--;
+diff --git a/radio/src/gui/colorlcd/radio/radio_version.cpp b/radio/src/gui/colorlcd/radio/radio_version.cpp
+index 03b75d1..a32e47e 100644
+--- a/radio/src/gui/colorlcd/radio/radio_version.cpp
++++ b/radio/src/gui/colorlcd/radio/radio_version.cpp
+@@ -25,6 +25,7 @@
+ #include "hal/module_port.h"
+ #include "edgetx.h"
+ #include "options.h"
++#include "stamp.h"
+ #include "etx_lv_theme.h"
+ 
+ #if defined(CROSSFIRE)
+@@ -407,8 +408,16 @@ void RadioVersionPage::build(Window* window)
+   std::string nl("\n");
+   std::string version;
+ 
++#if defined(MC_CUSTOM_BUILD)
++  // Display only - the internal stamps (fw_stamp / vers_stamp) stay untouched
++  // so Companion and the SD card version check keep working.
++  version += "FW: FlySky Paladin PL18 EV" + nl;
++  version += "VERS: MC " MC_VERSION " (based on EdgeTX " VERSION ")" + nl;
++  version += "BUILD: MisterCreators Custom MOCs" + nl;
++#else
+   version += fw_stamp + nl;
+   version += vers_stamp + nl;
++#endif
+   version += date_stamp + nl;
+   version += time_stamp + nl;
+   version += "OPTS: ";
+@@ -433,7 +442,26 @@ void RadioVersionPage::build(Window* window)
+   version += boardTouchType;
+ #endif
+ 
++#if defined(MC_CHARGE_DIAG)
++  // live charger pin diagnostics, refreshed every 500 ms
++  static std::string mcBaseText;
++  mcBaseText = version;
++  auto verText = new StaticText(textBox, {0, 0, LV_PCT(100), LV_SIZE_CONTENT}, version);
++  lv_timer_t* mcTimer = lv_timer_create(
++      [](lv_timer_t* t) {
++        extern void mcChargeDiagRuntime(char* buf, size_t len);
++        char buf[200];
++        mcChargeDiagRuntime(buf, sizeof(buf));
++        ((StaticText*)t->user_data)->setText(mcBaseText + "\n" + buf);
++      },
++      500, verText);
++  lv_obj_add_event_cb(
++      verText->getLvObj(),
++      [](lv_event_t* e) { lv_timer_del((lv_timer_t*)lv_event_get_user_data(e)); },
++      LV_EVENT_DELETE, mcTimer);
++#else
+   new StaticText(textBox, {0, 0, LV_PCT(100), LV_SIZE_CONTENT}, version);
++#endif
+ 
+   // Module and receivers versions
+   new TextButton(infoBox, {0, 0, LV_PCT(100), 0},
+diff --git a/radio/src/lua/api_general.cpp b/radio/src/lua/api_general.cpp
+index 250e1d7..d213851 100644
+--- a/radio/src/lua/api_general.cpp
++++ b/radio/src/lua/api_general.cpp
+@@ -31,6 +31,7 @@
+ #include "hal/module_port.h"
+ #include "hal/adc_driver.h"
+ #include "hal/rotary_encoder.h"
++#include "hal/usb_driver.h"
+ #include "switches.h"
+ #include "input_mapping.h"
+ #include "os/task.h"
+@@ -2171,6 +2172,54 @@ static int luaGetRSSI(lua_State * L)
+   return 3;
+ }
+ 
++/*luadoc
++@function usbConnected()
++
++Returns whether USB power is present (cable plugged into a PC, charger or
++power bank). This is the same signal that opens the USB mode popup.
++
++@retval plugged (boolean) true when USB is plugged in
++
++@retval mode (number) selected USB mode: 0 = not selected yet,
++1 = joystick, 2 = mass storage, 3 = serial
++
++@status current Introduced in MisterCreators Custom MOCs build (2.12.5)
++*/
++static int luaUsbConnected(lua_State * L)
++{
++  bool plugged = usbPlugged() != 0;
++  lua_pushboolean(L, plugged);
++  lua_pushinteger(L, plugged ? getSelectedUsbMode() : 0);
++  return 2;
++}
++
++#if defined(MC_CUSTOM_BUILD)
++/*luadoc
++@function getChargeState()
++
++Returns the battery charge state of the radio.
++
++@retval state (number) 0 = no charger, 1 = charging, 2 = full
++
++@retval source (number) 0 = none, 1 = USB, 2 = wireless charger
++
++@status current Introduced in MisterCreators Custom MOCs build (MC 1.0)
++*/
++extern uint8_t mcGetChargeState();
++extern uint8_t mcGetChargeSource();
++static int luaGetChargeState(lua_State * L)
++{
++#if defined(SIMU)
++  lua_pushinteger(L, 0);
++  lua_pushinteger(L, 0);
++#else
++  lua_pushinteger(L, mcGetChargeState());
++  lua_pushinteger(L, mcGetChargeSource());
++#endif
++  return 2;
++}
++#endif
++
+ /*luadoc
+ @function loadScript(file [, mode], [,env])
+ 
+@@ -3208,6 +3257,10 @@ LROT_BEGIN(etxlib, NULL, 0)
+   LROT_FUNCENTRY( defaultStick, luaDefaultStick )
+   LROT_FUNCENTRY( defaultChannel, luaDefaultChannel )
+   LROT_FUNCENTRY( getRSSI, luaGetRSSI )
++  LROT_FUNCENTRY( usbConnected, luaUsbConnected )
++#if defined(MC_CUSTOM_BUILD)
++  LROT_FUNCENTRY( getChargeState, luaGetChargeState )
++#endif
+   LROT_FUNCENTRY( killEvents, luaKillEvents )
+   LROT_FUNCENTRY( loadScript, luaLoadScript )
+   LROT_FUNCENTRY( getUsage, luaGetUsage )
+diff --git a/radio/src/main.cpp b/radio/src/main.cpp
+index ac170e1..3210b86 100644
+--- a/radio/src/main.cpp
++++ b/radio/src/main.cpp
+@@ -330,7 +330,12 @@ void checkStorageUpdate()
+ void checkBatteryAlarms()
+ {
+   // TRACE("checkBatteryAlarms()");
++#if defined(MC_CUSTOM_BUILD) && !defined(SIMU)
++  extern bool mcChargerConnected();
++  if (IS_TXBATT_WARNING() && !mcChargerConnected()) {
++#else
+   if (IS_TXBATT_WARNING()) {
++#endif
+     AUDIO_TX_BATTERY_LOW();
+     // TRACE("checkBatteryAlarms(): battery low");
+   }
+diff --git a/radio/src/targets/pl18/CMakeLists.txt b/radio/src/targets/pl18/CMakeLists.txt
+index e438b07..680d9b9 100644
+--- a/radio/src/targets/pl18/CMakeLists.txt
++++ b/radio/src/targets/pl18/CMakeLists.txt
+@@ -99,6 +99,37 @@ elseif(PCBREV STREQUAL PL18EV)
+   set(LED_STRIP ON)
+   set(AFHDS3 ON)
+   set(KEY_DRIVER key_driver.cpp)
++
++  # Optional: internal CRSF module on the Bluetooth port
++  # (USART3 on PB.10/PB.11 = TX3/RX3 = TX_BLE/RX_BLE). No power control pin is used.
++  # UART7 (PF.06/PF.07) is left untouched, so the stick-end button mod keeps working.
++  option(PL18EV_INTERNAL_CRSF "Internal CRSF module on the Bluetooth pads (USART3)" OFF)
++  if(PL18EV_INTERNAL_CRSF)
++    add_definitions(-DPL18EV_INTERNAL_CRSF)
++    # Bluetooth port can carry either the MC Brick Bridge (CRSF) or a Multi module
++    set(INTERNAL_MODULES CRSF;MULTI CACHE STRING "Internal modules")
++    set(DEFAULT_INTERNAL_MODULE CROSSFIRE CACHE STRING "Default internal module")
++
++    # Power switching of the internal module via BT_EN (PI.08), high = on.
++    # PI.08 switches BT_3V3 on the Bluetooth socket (measured on the radio).
++    # Also needed for flashing a Multi module from the radio.
++    option(PL18EV_INTMODULE_PWR_PI8 "Switch internal module power via PI.08 (BT_EN)" ON)
++    if(PL18EV_INTMODULE_PWR_PI8)
++      add_definitions(-DPL18EV_INTMODULE_PWR_PI8)
++    endif()
++
++    # MisterCreators Custom MOCs build identification
++    set(MC_VERSION "1.0" CACHE STRING "MisterCreators build version")
++    option(MC_CHARGE_DIAG "Charger diagnostics on charge screen and version page" OFF)
++    add_definitions(-DMC_CUSTOM_BUILD -DMC_VERSION="${MC_VERSION}" -DUSB_CHARGER)
++    if(MC_CHARGE_DIAG)
++      add_definitions(-DMC_CHARGE_DIAG)
++    endif()
++    option(MC_NO_RUNTIME_CHARGE "Test: disable charge polling while running" OFF)
++    if(MC_NO_RUNTIME_CHARGE)
++      add_definitions(-DMC_NO_RUNTIME_CHARGE)
++    endif()
++  endif()
+ else()
+   set(FLAVOUR pl18)
+   add_definitions(-DRADIO_PL18 -DUSE_HATS_AS_KEYS)
+diff --git a/radio/src/targets/pl18/battery_driver.cpp b/radio/src/targets/pl18/battery_driver.cpp
+index c8ff23d..de6def4 100644
+--- a/radio/src/targets/pl18/battery_driver.cpp
++++ b/radio/src/targets/pl18/battery_driver.cpp
+@@ -21,6 +21,10 @@
+ 
+ #include "edgetx.h"
+ #include "battery_driver.h"
++#include "hal/usb_driver.h"
++#include "touch_driver.h"
++#include "hal/adc_driver.h"
++#include "stm32_hal.h"
+ #include "boards/generic_stm32/rgb_leds.h"
+ 
+ #define  __BATTERY_DRIVER_C__
+@@ -47,6 +51,16 @@
+   #define UCHARGER_CHARGE_END_SAMPLING_CNT   10
+ #endif
+ 
++#if defined(RADIO_PL18EV) && defined(MC_CUSTOM_BUILD)
++  // MC: the charge-end pin of the PL18EV toggles while charging.
++  // Charging is shown as soon as the pin says so, "full" only after the pin
++  // stayed at "full" for 30 s without interruption.
++  #undef  UCHARGER_CHARGING_SAMPLING_CNT
++  #undef  UCHARGER_CHARGE_END_SAMPLING_CNT
++  #define UCHARGER_CHARGING_SAMPLING_CNT     1
++  #define UCHARGER_CHARGE_END_SAMPLING_CNT   3000
++#endif
++
+ #define WCHARGER_SAMPLING_CNT                30
+ #if defined(RADIO_PL18U)
+   #define WCHARGER_CHARGING_SAMPLING_CNT     1
+@@ -55,6 +69,12 @@
+   #define WCHARGER_CHARGING_SAMPLING_CNT     10
+   #define WCHARGER_CHARGE_END_SAMPLING_CNT   10
+ #endif
++#if defined(RADIO_PL18EV) && defined(MC_CUSTOM_BUILD)
++  #undef  WCHARGER_CHARGING_SAMPLING_CNT
++  #undef  WCHARGER_CHARGE_END_SAMPLING_CNT
++  #define WCHARGER_CHARGING_SAMPLING_CNT     1
++  #define WCHARGER_CHARGE_END_SAMPLING_CNT   3000
++#endif
+ #define WCHARGER_LOW_CURRENT_DELAY_CNT       6000
+ #define WCHARGER_HIGH_CURRENT_DELAY_CNT      24000
+ #define CHARGER_DETECTION_TIMEOUT            40    // 400ms
+@@ -67,8 +87,9 @@ typedef struct
+   bool isChargingDetectionReady : 1;
+   bool isHighCurrent : 1;
+   uint8_t chargerSamplingCount;
+-  uint8_t chargingSamplingCount;
+-  uint8_t chargeEndSamplingCount;
++  uint16_t chargingSamplingCount;
++  uint16_t chargeEndSamplingCount;
++  uint8_t stableSamplingCount;  // MC: confirms the initial state
+ } STRUCT_BATTERY_CHARGER;
+ 
+ static STRUCT_BATTERY_CHARGER uCharger; // USB charger
+@@ -79,14 +100,65 @@ static STRUCT_BATTERY_CHARGER uCharger; // USB charger
+   static uint16_t wirelessHighCurrentDelay = 0;
+ #endif
+ 
++// MisterCreators: charge state while the radio is running
++static volatile bool mcRuntimeCharge = false;
++static volatile uint16_t mcChargeState = CHARGE_UNKNOWN;
++
++#if defined(MC_CHARGE_DIAG)
++#define PIN01(p) (gpio_read(p) ? 1 : 0)
++static void mcPinString(char* buf, size_t len)
++{
++#if defined(WIRELESS_CHARGER)
++  snprintf(buf, len, "USB:%d END:%d EN:%d | QI:%d END:%d EN:%d I:%d",
++           PIN01(UCHARGER_GPIO), PIN01(UCHARGER_CHARGE_END_GPIO), PIN01(UCHARGER_EN_GPIO),
++           PIN01(WCHARGER_GPIO), PIN01(WCHARGER_CHARGE_END_GPIO), PIN01(WCHARGER_EN_GPIO),
++           PIN01(WCHARGER_I_CONTROL_GPIO));
++#else
++  snprintf(buf, len, "USB:%d END:%d EN:%d",
++           PIN01(UCHARGER_GPIO), PIN01(UCHARGER_CHARGE_END_GPIO), PIN01(UCHARGER_EN_GPIO));
++#endif
++}
++
++static const char* const mcStateNames[] = {"UNKNOWN", "NONE", "CHARGING", "FULL"};
++
++uint32_t mcDiagTouchCount = 0;
++uint32_t mcDiagPowerCount = 0;
++uint32_t mcDiagTrimCount = 0;
++uint32_t mcDiagEndToggles = 0;
++uint32_t mcDiagTouchIntCount = 0;
++
++// used by the version page while the radio is running
++void mcChargeDiagRuntime(char* buf, size_t len)
++{
++  char pins[96];
++  mcPinString(pins, sizeof(pins));
++  snprintf(buf, len, "CHG (Diag):\n%s\nState: %s  usb:%d  END-Wechsel:%lu  Batt:%d.%02dV\nBT_EN PI8:%d (nur gelesen)",
++           pins, mcStateNames[mcChargeState & 3], usbPlugged(), (unsigned long)mcDiagEndToggles,
++           getBatteryVoltage() / 100, getBatteryVoltage() % 100,
++           gpio_read(GPIO_PIN(GPIOI, 8)) ? 1 : 0);
++}
++#endif
++
+ void chargerDetection(STRUCT_BATTERY_CHARGER* charger, uint8_t chargerPinActive, uint8_t samplingCountThreshold)
+ {
+-  if ((charger->hasCharger && chargerPinActive) || (!charger->hasCharger && !chargerPinActive))
++  // MC fix: the original code only became "ready" when the pin state differed
++  // from the initial guess. If the pin was read wrong at init (charger IC not
++  // settled yet), detection never became ready and the state stayed UNKNOWN.
++  if ((charger->hasCharger != 0) == (chargerPinActive != 0))
+   {
+     charger->chargerSamplingCount = 0;
++    if (!charger->isChargerDetectionReady)
++    {
++      if (++charger->stableSamplingCount >= samplingCountThreshold)
++      {
++        charger->stableSamplingCount = 0;
++        charger->isChargerDetectionReady = true;
++      }
++    }
+   }
+   else
+   {
++    charger->stableSamplingCount = 0;
+     charger->chargerSamplingCount++;
+     if (charger->chargerSamplingCount >= samplingCountThreshold)
+     {
+@@ -106,7 +178,7 @@ void resetChargeEndDetection(STRUCT_BATTERY_CHARGER* charger)
+ }
+ 
+ void chargeEndDetection(STRUCT_BATTERY_CHARGER* charger, uint8_t chargeEndPinActive,
+-                        uint8_t chargingSamplingCountThreshold, uint8_t chargeEndSamplingCountThreshold)
++                        uint16_t chargingSamplingCountThreshold, uint16_t chargeEndSamplingCountThreshold)
+ {
+   if (charger->isChargeEnd)
+   {
+@@ -175,6 +247,14 @@ void chargeEndDetection(STRUCT_BATTERY_CHARGER* charger, uint8_t chargeEndPinAct
+ uint16_t get_uCharger_state(uint16_t state)
+ {
+   chargerDetection(&uCharger, IS_UCHARGER_ACTIVE(), UCHARGER_SAMPLING_CNT);
++#if defined(MC_CHARGE_DIAG)
++  {
++    static int last = -1;
++    int cur = gpio_read(UCHARGER_CHARGE_END_GPIO) ? 1 : 0;
++    if (last >= 0 && cur != last) mcDiagEndToggles++;
++    last = cur;
++  }
++#endif
+   if (uCharger.isChargerDetectionReady)
+   {
+     if (uCharger.hasCharger)  // USB charger can be detected properly no matter it is enabled or not
+@@ -195,6 +275,13 @@ uint16_t get_uCharger_state(uint16_t state)
+           state = CHARGE_STARTED;
+         }
+       }
++#if defined(MC_CUSTOM_BUILD)
++      else
++      {
++        // charger present, "full" not confirmed yet: show charging
++        state = CHARGE_STARTED;
++      }
++#endif
+     }
+     else
+     {
+@@ -235,8 +322,15 @@ uint16_t get_wCharger_state(uint16_t state)
+           state = CHARGE_STARTED;
+         }
+       }
++#if defined(MC_CUSTOM_BUILD)
++      else
++      {
++        state = CHARGE_STARTED;
++      }
++#endif
+ 
+-      // Charge current control
++      // Charge current control (only on the charge screen, unchanged at runtime)
++      if (!mcRuntimeCharge) {
+       wirelessLowCurrentDelay = 0;
+       if (wirelessHighCurrentDelay >= WCHARGER_HIGH_CURRENT_DELAY_CNT)
+       {
+@@ -247,6 +341,7 @@ uint16_t get_wCharger_state(uint16_t state)
+       {
+         wirelessHighCurrentDelay++;
+       }
++      }
+     }
+     else
+     {
+@@ -258,6 +353,7 @@ uint16_t get_wCharger_state(uint16_t state)
+ #endif
+ 
+       // Charge current control
++      if (!mcRuntimeCharge) {
+       wirelessHighCurrentDelay = 0;
+       if (wirelessLowCurrentDelay >= WCHARGER_LOW_CURRENT_DELAY_CNT)
+       {
+@@ -268,6 +364,7 @@ uint16_t get_wCharger_state(uint16_t state)
+       {
+         wirelessLowCurrentDelay++;
+       }
++      }
+     }
+   }
+ 
+@@ -293,7 +390,8 @@ uint16_t get_battery_charge_state()
+ }
+ 
+ bool isChargerActive()
+-{  
++{
++  mcRuntimeCharge = false;  // MC: avoid concurrent polling from per10ms()  
+ #if defined(WIRELESS_CHARGER)
+   uint16_t timeout = CHARGER_DETECTION_TIMEOUT;
+   while (!(uCharger.isChargerDetectionReady && wCharger.isChargerDetectionReady) && timeout--)
+@@ -337,8 +435,10 @@ void battery_charge_init()
+ #else
+   ENABLE_UCHARGER();
+ #endif  // defined(RADIO_PL18U)
+-  uCharger.hasCharger = !IS_UCHARGER_ACTIVE();  // Init for sampling count works
++  uCharger.hasCharger = IS_UCHARGER_ACTIVE();
+   uCharger.isChargerDetectionReady = false;
++  uCharger.stableSamplingCount = 0;
++  uCharger.chargerSamplingCount = 0;
+   resetChargeEndDetection(&uCharger);
+ 
+ #if defined(WIRELESS_CHARGER)
+@@ -352,13 +452,112 @@ void battery_charge_init()
+   // Wireless charger state init
+   ENABLE_WCHARGER();
+   WCHARGER_CURRENT_LOW();
+-  wCharger.hasCharger = !IS_WCHARGER_ACTIVE();  // Init for sampling count works
++  wCharger.hasCharger = IS_WCHARGER_ACTIVE();
+   wCharger.isChargerDetectionReady = false;
++  wCharger.stableSamplingCount = 0;
++  wCharger.chargerSamplingCount = 0;
+   resetChargeEndDetection(&wCharger);
+ #endif  // defined(WIRELESS_CHARGER)
+ }
+ 
++#if defined(MC_CUSTOM_BUILD)
++// ---------------------------------------------------------------------------
++// MC: battery voltage / percentage on the charge screen and the LED strip.
++// The charge screen runs before the SD card is read, so the voltage
++// calibration and the battery meter range are kept in an RTC backup register
++// (stays alive while the radio is off).
++// ---------------------------------------------------------------------------
++#define MC_BKP_REG    (RTC->BKP19R)
++#define MC_BKP_MAGIC  0x4DU  // 'M'
++
++static uint32_t mcBattSettingsWord()
++{
++  return (MC_BKP_MAGIC << 24) |
++         ((uint32_t)(uint8_t)g_eeGeneral.txVoltageCalibration << 16) |
++         ((uint32_t)(uint8_t)g_eeGeneral.vBatMin << 8) |
++         (uint32_t)(uint8_t)g_eeGeneral.vBatMax;
++}
++
++// runtime: remember the current settings (called every second)
++static void mcStoreBattSettings()
++{
++  uint32_t v = mcBattSettingsWord();
++  if (MC_BKP_REG != v) {
++    HAL_PWR_EnableBkUpAccess();
++    MC_BKP_REG = v;
++  }
++}
++
++// charge screen: restore the settings into g_eeGeneral (overwritten later
++// when the SD card is read)
++void mcLoadBattSettings()
++{
++  __HAL_RCC_PWR_CLK_ENABLE();
++  HAL_PWR_EnableBkUpAccess();
++  uint32_t v = MC_BKP_REG;
++  if ((v >> 24) == MC_BKP_MAGIC) {
++    g_eeGeneral.txVoltageCalibration = (int8_t)((v >> 16) & 0xFF);
++    g_eeGeneral.vBatMin = (int8_t)((v >> 8) & 0xFF);
++    g_eeGeneral.vBatMax = (int8_t)(v & 0xFF);
++  } else {
++    g_eeGeneral.txVoltageCalibration = 0;
++    g_eeGeneral.vBatMin = BATTERY_MIN - 90;
++    g_eeGeneral.vBatMax = BATTERY_MAX - 120;
++  }
++}
++
++static int mcProgress = 0;   // lit segments 0..4 (display + LED strip)
++static uint16_t mcVolt = 0;  // 10 mV
++static int mcPct = -1;       // -1 = unknown
++
++static void mcUpdateLevel(uint16_t chargeState)
++{
++  uint32_t sum = 0;
++  for (int i = 0; i < 4; i++) {
++    adcRead();
++    sum += getBatteryVoltage();
++  }
++  mcVolt = sum / 4;
++
++  int vmin = (g_eeGeneral.vBatMin + 90) * 10;
++  int vmax = (g_eeGeneral.vBatMax + 120) * 10;
++  if (mcVolt < 100 || vmax <= vmin) {
++    mcPct = -1;
++  } else {
++    int pct = ((int)mcVolt - vmin) * 100 / (vmax - vmin);
++    mcPct = limit<int>(0, pct, 100);
++  }
++
++  if (chargeState == CHARGE_FINISHED) {
++    mcPct = 100;
++    mcProgress = 4;
++  } else if (chargeState == CHARGE_STARTED) {
++    // the voltage is lifted while charging: never claim 100 % before "full"
++    if (mcPct > 99) mcPct = 99;
++    int base = mcPct < 0 ? 0 : mcPct / 25;
++    mcProgress++;
++    if (mcProgress > 4 || mcProgress < base) mcProgress = base;
++  } else {
++    mcProgress = 0;
++  }
++}
++#endif
++
+ void ledChargingInfo(uint16_t chargeState) {
++#if defined(LED_STRIP_GPIO) && defined(MC_CUSTOM_BUILD)
++  // LEDs show the same fill as the display, starting at LED4 (left)
++  int lit = (chargeState == CHARGE_FINISHED) ? LED_STRIP_LENGTH
++                                             : (mcProgress * LED_STRIP_LENGTH) / 4;
++  for (uint8_t i = 0; i < LED_STRIP_LENGTH; i++) {
++    if ((LED_STRIP_LENGTH - 1 - i) < lit) {
++      rgbSetLedColor(i, 0, 20, 0);
++    } else {
++      rgbSetLedColor(i, 0, 0, 0);
++    }
++  }
++  rgbLedColorApply();
++  return;
++#endif
+ #if defined(LED_STRIP_GPIO)
+   static int ledIdx = 0;
+   ledIdx--;
+@@ -376,12 +575,20 @@ void ledChargingInfo(uint16_t chargeState) {
+ #endif
+ }
+ 
++extern const char* boardTouchType;
+ static Window* chargeWindow = nullptr;
+ 
+ void drawChargingInfo(uint16_t chargeState) {
+   static int progress = -1;
+   static StaticText* stateText = nullptr;
+   static lv_obj_t* battBox = nullptr;
++#if defined(MC_CUSTOM_BUILD)
++  static StaticText* voltText = nullptr;
++  static StaticText* pctText = nullptr;
++#endif
++#if defined(MC_CHARGE_DIAG)
++  static StaticText* diagText = nullptr;
++#endif
+ 
+   const char* text;
+   int h;
+@@ -392,7 +599,11 @@ void drawChargingInfo(uint16_t chargeState) {
+       progress += 1;
+       if (progress > 4) progress = 0;
+       text = STR_BATTERYCHARGING;
++#if defined(MC_CUSTOM_BUILD)
++      h = ((BATTERY_H_INNER * mcProgress) / 4);
++#else
+       h = ((BATTERY_H_INNER * progress) / 4);
++#endif
+       break;
+     case CHARGE_FINISHED:
+       text = STR_BATTERYFULL;
+@@ -424,10 +635,64 @@ void drawChargingInfo(uint16_t chargeState) {
+     etx_solid_bg(box, COLOR_THEME_PRIMARY2_INDEX);
+ 
+     battBox = lv_obj_create(chargeWindow->getLvObj());
++
++#if defined(MC_CUSTOM_BUILD)
++    // created after the fill so they are drawn on top of it
++    voltText = new StaticText(chargeWindow, {0, BATTERY_TOP + BATTERY_H / 2 - 40, LCD_W, 50},
++                              "", COLOR_THEME_PRIMARY2_INDEX, CENTERED | FONT(XL));
++    pctText = new StaticText(chargeWindow, {0, BATTERY_TOP + BATTERY_H / 2 + 12, LCD_W, 36},
++                             "", COLOR_THEME_PRIMARY2_INDEX, CENTERED | FONT(L));
++#endif
++
++#if defined(MC_CHARGE_DIAG)
++    diagText = new StaticText(chargeWindow, {0, 0, LCD_W, BATTERY_TOP - BATTERY_CONNECTOR_H},
++                              "", COLOR_THEME_PRIMARY2_INDEX, CENTERED | FONT(XS));
++#endif
+   }
+ 
+   stateText->setText(text);
+ 
++#if defined(MC_CUSTOM_BUILD)
++  {
++    char buf[16];
++    if (mcVolt >= 100) {
++      snprintf(buf, sizeof(buf), "%d.%02d V", mcVolt / 100, mcVolt % 100);
++      voltText->setText(buf);
++    } else {
++      voltText->setText("");
++    }
++    if (mcPct >= 0 && chargeState != CHARGE_UNKNOWN && chargeState != CHARGE_NONE) {
++      snprintf(buf, sizeof(buf), "%d %%", mcPct);
++      pctText->setText(buf);
++    } else {
++      pctText->setText("");
++    }
++  }
++#endif
++
++#if defined(MC_CHARGE_DIAG)
++  {
++    char pins[96];
++    char buf[200];
++    mcPinString(pins, sizeof(pins));
++#if defined(WIRELESS_CHARGER)
++    snprintf(buf, sizeof(buf), "%s\nUSB h%d r%d e%d c%d | QI h%d r%d e%d c%d -> %s  END-W:%lu\nTouch:%lu INT:%lu(%d) Trim:%lu Pwr:%lu %s",
++             pins,
++             uCharger.hasCharger, uCharger.isChargerDetectionReady, uCharger.isChargeEnd, uCharger.isChargingDetectionReady,
++             wCharger.hasCharger, wCharger.isChargerDetectionReady, wCharger.isChargeEnd, wCharger.isChargingDetectionReady,
++             mcStateNames[chargeState & 3], (unsigned long)mcDiagEndToggles, (unsigned long)mcDiagTouchCount,
++             (unsigned long)mcDiagTouchIntCount, gpio_read(TOUCH_INT_GPIO) ? 1 : 0,
++             (unsigned long)mcDiagTrimCount, (unsigned long)mcDiagPowerCount, boardTouchType);
++#else
++    snprintf(buf, sizeof(buf), "%s\nUSB h%d r%d e%d c%d -> %s\nTouch:%lu  Power:%lu",
++             pins,
++             uCharger.hasCharger, uCharger.isChargerDetectionReady, uCharger.isChargeEnd, uCharger.isChargingDetectionReady,
++             mcStateNames[chargeState & 3], (unsigned long)mcDiagTouchCount, (unsigned long)mcDiagPowerCount);
++#endif
++    diagText->setText(buf);
++  }
++#endif
++
+   lv_obj_set_pos(battBox, (LCD_W - BATTERY_W_INNER) / 2, BATTERY_TOP_INNER + BATTERY_H_INNER - h);
+   lv_obj_set_size(battBox, BATTERY_W_INNER, h);
+   etx_solid_bg(battBox, color);
+@@ -447,7 +712,8 @@ void battery_charge_end()
+   }
+ }
+ 
+-#define CHARGE_INFO_DURATION 5000 // ms
++#define CHARGE_INFO_DURATION      10000 // ms, after touch / trim / power press / state change
++#define CHARGE_INFO_DURATION_PLUG 30000 // ms, after plugging in
+ 
+ // This method should be called by timer interrupt or by GPIO interrupt
+ void handle_battery_charge(uint32_t last_press_time)
+@@ -457,34 +723,48 @@ void handle_battery_charge(uint32_t last_press_time)
+   static uint16_t lastState = CHARGE_UNKNOWN;
+   static uint32_t info_until = 0;
+   static bool lcdInited = false;
++  static bool firstCall = true;
++  static uint32_t lastPress = 0;
+ 
+   uint32_t now = timersGetMsTick();
+   uint16_t chargeState = get_battery_charge_state();
+-  if (chargeState != CHARGE_UNKNOWN) {
+ 
+-    if (lastState != chargeState) {
+-      // Avoid positive check when none and unknown
+-      if (lastState + chargeState > 1) {
+-        // Charge state changed - last state known
+-        info_until = now + (CHARGE_INFO_DURATION);
+-      }
+-    }
+-    // Power buttons pressed
+-    else if (now - last_press_time < POWER_ON_DELAY) {
++  // charger just plugged in (or radio switched off while charging)
++  if (firstCall) {
++    firstCall = false;
++    info_until = now + CHARGE_INFO_DURATION_PLUG;
++  }
++
++  if (chargeState != CHARGE_UNKNOWN) {
++    if (lastState != chargeState && lastState + chargeState > 1) {
++      // Charge state changed (e.g. charging -> full)
+       info_until = now + CHARGE_INFO_DURATION;
+     }
+     lastState = chargeState;
+   }
+ 
++  // touch or short power button press: show again
++  if (last_press_time != 0 && last_press_time != lastPress) {
++    lastPress = last_press_time;
++    info_until = now + CHARGE_INFO_DURATION;
++  }
++
+   if (!lcdInited) {
+     lcdInited = true;
+     backlightInit();
+     lcdInitDisplayDriver();
++#if defined(MC_CUSTOM_BUILD)
++    // MC: LCD init may reset the touch controller - initialise it again
++    touchPanelInit();
++#endif
+   }
+ 
+   if (updateTime == 0 || ((timersGetMsTick() - updateTime) >= 500))
+   {
+     updateTime = timersGetMsTick();
++#if defined(MC_CUSTOM_BUILD)
++    mcUpdateLevel(chargeState);
++#endif
+     ledChargingInfo(chargeState);
+ 
+ #if !defined(BATTERY_DRIVER_DEBUG)
+@@ -529,3 +809,73 @@ void handle_battery_charge(uint32_t last_press_time)
+ #endif
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// MisterCreators: charge state while the radio is running
++// ---------------------------------------------------------------------------
++
++// called once the radio has left the charge screen / boot
++void mcChargeRuntimeStart()
++{
++#if !defined(MC_NO_RUNTIME_CHARGE)
++  mcRuntimeCharge = true;
++#endif
++}
++
++// called every 10 ms from per10ms()
++void mcChargeTick()
++{
++#if !defined(SIMU)
++  if (!mcRuntimeCharge) return;
++  mcChargeState = get_battery_charge_state();
++#if defined(MC_CUSTOM_BUILD)
++  static uint8_t cnt = 0;
++  if (++cnt >= 100) {
++    cnt = 0;
++    mcStoreBattSettings();
++  }
++#endif
++#endif
++}
++
++// charger (USB or wireless) is connected
++bool mcChargerConnected()
++{
++  if (!mcRuntimeCharge) return false;
++#if defined(WIRELESS_CHARGER)
++  return (uCharger.isChargerDetectionReady && uCharger.hasCharger) ||
++         (wCharger.isChargerDetectionReady && wCharger.hasCharger);
++#else
++  return uCharger.isChargerDetectionReady && uCharger.hasCharger;
++#endif
++}
++
++// 0 = no charger, 1 = charging, 2 = full
++uint8_t mcGetChargeState()
++{
++  if (!mcChargerConnected()) return 0;
++  switch (mcChargeState) {
++    case CHARGE_STARTED:  return 1;
++    case CHARGE_FINISHED: return 2;
++    default:              return 1;  // charger present, state still settling
++  }
++}
++
++// 0 = none, 1 = USB, 2 = wireless
++uint8_t mcGetChargeSource()
++{
++  if (!mcRuntimeCharge) return 0;
++  if (uCharger.isChargerDetectionReady && uCharger.hasCharger) return 1;
++#if defined(WIRELESS_CHARGER)
++  if (wCharger.isChargerDetectionReady && wCharger.hasCharger) return 2;
++#endif
++  return 0;
++}
++
++#if defined(USB_CHARGER)
++// charge bolt in the top bar battery icon
++bool usbChargerLed()
++{
++  return mcGetChargeState() == 1;
++}
++#endif
+diff --git a/radio/src/targets/pl18/battery_driver.h b/radio/src/targets/pl18/battery_driver.h
+index 2b8da52..edbb8ca 100644
+--- a/radio/src/targets/pl18/battery_driver.h
++++ b/radio/src/targets/pl18/battery_driver.h
+@@ -54,3 +54,11 @@ extern uint16_t get_battery_charge_state();
+ extern uint16_t getBatteryVoltage();   // returns current battery voltage in 10mV steps
+ extern bool isChargerActive();
+ extern void battery_charge_end();
++
++// MisterCreators: charge state while the radio is running
++extern void mcChargeRuntimeStart();
++extern void mcLoadBattSettings();
++extern void mcChargeTick();
++extern bool mcChargerConnected();
++extern uint8_t mcGetChargeState();   // 0 = no charger, 1 = charging, 2 = full
++extern uint8_t mcGetChargeSource();  // 0 = none, 1 = USB, 2 = wireless
+diff --git a/radio/src/targets/pl18/board.cpp b/radio/src/targets/pl18/board.cpp
+index 5388abb..9aaedcd 100644
+--- a/radio/src/targets/pl18/board.cpp
++++ b/radio/src/targets/pl18/board.cpp
+@@ -48,6 +48,13 @@
+ 
+ #include "timers_driver.h"
+ #include "battery_driver.h"
++#include "hal/key_driver.h"
++#if defined(MC_CHARGE_DIAG)
++extern uint32_t mcDiagTouchCount;
++extern uint32_t mcDiagPowerCount;
++extern uint32_t mcDiagTrimCount;
++extern uint32_t mcDiagTouchIntCount;
++#endif
+ #include "touch_driver.h"
+ 
+ #include "bitmapbuffer.h"
+@@ -245,11 +252,23 @@ void boardInit()
+   if (UNEXPECTED_SHUTDOWN()) {
+     pwrOn();
+   } else if (isChargerActive()) {
++#if defined(MC_CUSTOM_BUILD)
++    // MC: battery voltage on the charge screen
++    adcInit(&_adc_driver);
++    mcLoadBattSettings();
++    // MC: trims can wake the charge screen (the power buttons need both hands)
++    keysInit();
++    uint32_t mcLastTrims = 0;
++    uint8_t mcTouchContacts = 0;
++#endif
+     while (true) {
+       pwrOn();
+       uint32_t now = timersGetMsTick();
+       if (pwrPressed()) {
+         press_end = now;
++#if defined(MC_CHARGE_DIAG)
++        if (press_start == 0) mcDiagPowerCount++;
++#endif
+         if (press_start == 0) press_start = now;
+         if ((now - press_start) > POWER_ON_DELAY) {
+           break;
+@@ -260,9 +279,40 @@ void boardInit()
+       } else {
+         uint32_t press_end_touch = press_end;
+         if (touchPanelEventOccured()) {
++#if defined(MC_CHARGE_DIAG)
++          mcDiagTouchCount++;
++#endif
+           touchPanelRead();
+           press_end_touch = timersGetMsTick();
+         }
++#if defined(MC_CUSTOM_BUILD)
++        // any trim pressed
++        uint32_t mcTrims = readTrims();
++        if (mcTrims && !mcLastTrims) {
++#if defined(MC_CHARGE_DIAG)
++          mcDiagTrimCount++;
++#endif
++          press_end_touch = timersGetMsTick();
++        }
++        mcLastTrims = mcTrims;
++        // touch: the INT line also pulses without a finger (noise while
++        // charging), so a wake-up needs a real contact read over I2C in
++        // 3 consecutive polls (~30 ms)
++        int mcTouchInt = gpio_read(TOUCH_INT_GPIO) ? 1 : 0;
++        if (!mcTouchInt || mcTouchContacts > 0) {
++          if (mcTouchHasContact()) {
++            if (mcTouchContacts < 255) mcTouchContacts++;
++            if (mcTouchContacts == 3) {
++#if defined(MC_CHARGE_DIAG)
++              mcDiagTouchIntCount++;
++#endif
++              press_end_touch = timersGetMsTick();
++            }
++          } else {
++            mcTouchContacts = 0;
++          }
++        }
++#endif
+         press_start = 0;
+         handle_battery_charge(press_end_touch);
+         delay_ms(10);
+@@ -286,6 +336,10 @@ void boardInit()
+   adcInit(&_adc_driver);
+   hapticInit();
+ 
++#if defined(MC_CUSTOM_BUILD)
++  mcChargeRuntimeStart();
++#endif
++
+ 
+  #if defined(RTCLOCK)
+   rtcInit(); // RTC must be initialized before rambackupRestore() is called
+diff --git a/radio/src/targets/pl18/board.h b/radio/src/targets/pl18/board.h
+index fc1a771..13476f4 100644
+--- a/radio/src/targets/pl18/board.h
++++ b/radio/src/targets/pl18/board.h
+@@ -96,6 +96,14 @@ extern "C" void SDRAM_Init();
+     else                                        \
+       gpio_set(INTMODULE_PWR_GPIO);             \
+   } while (0)
++#elif defined(PL18EV_INTERNAL_CRSF) && defined(PL18EV_INTMODULE_PWR_PI8)
++  // internal module on the Bluetooth port, power switched via PI.08 (high = on)
++  #define INTERNAL_MODULE_ON()            gpio_set(INTMODULE_PWR_GPIO)
++  #define INTERNAL_MODULE_OFF()           gpio_clear(INTMODULE_PWR_GPIO)
++#elif defined(PL18EV_INTERNAL_CRSF)
++  // internal module on the Bluetooth port: no power switching
++  #define INTERNAL_MODULE_ON()
++  #define INTERNAL_MODULE_OFF()
+ #elif defined(RADIO_NB4P) || defined(RADIO_PL18U)
+   #define INTERNAL_MODULE_ON()            gpio_clear(INTMODULE_PWR_GPIO)
+   #define INTERNAL_MODULE_OFF()           gpio_set(INTMODULE_PWR_GPIO);
+@@ -226,13 +234,18 @@ bool isBacklightEnabled();
+ }
+ #endif
+ 
++#if defined(USB_CHARGER)
++bool usbChargerLed();
++#endif
++
+ #if defined(RADIO_NB4P) || defined(RADIO_NV14_FAMILY)
+   #define IS_UCHARGER_ACTIVE()              gpio_read(UCHARGER_GPIO) ? (gpio_read(UCHARGER_CHARGE_END_GPIO) ? 0 : 1) : 1  
+ #else
+   #define IS_UCHARGER_ACTIVE()              gpio_read(UCHARGER_GPIO) ? 1 : 0
+ #endif
+ 
+-#if defined(RADIO_NB4P) || defined(RADIO_NV14_FAMILY)
++#if defined(RADIO_NB4P) || defined(RADIO_NV14_FAMILY) || (defined(RADIO_PL18EV) && defined(MC_CUSTOM_BUILD))
++  // MC: on the PL18EV PB13 is high while charging (measured: END=1 at 3.9 V)
+   #define IS_UCHARGER_CHARGE_END_ACTIVE()   gpio_read(UCHARGER_CHARGE_END_GPIO) ? 0 : 1
+ #else
+   #define IS_UCHARGER_CHARGE_END_ACTIVE()   gpio_read(UCHARGER_CHARGE_END_GPIO) ? 1 : 0
+diff --git a/radio/src/targets/pl18/hal.h b/radio/src/targets/pl18/hal.h
+index 4e114e5..14baa0e 100644
+--- a/radio/src/targets/pl18/hal.h
++++ b/radio/src/targets/pl18/hal.h
+@@ -873,8 +873,12 @@
+   #define INTMODULE_TIMER_IRQn            TIM3_IRQn
+   #define INTMODULE_TIMER_IRQHandler      TIM3_IRQHandler
+   #define INTMODULE_TIMER_FREQ            (PERI1_FREQUENCY * TIMER_MULT_APB1)
+-#elif defined(RADIO_NB4P)
++#elif defined(RADIO_NB4P) || defined(PL18EV_INTERNAL_CRSF)
++  // NB4P internal module / PL18EV internal CRSF on the Bluetooth port (TX3/RX3).
++  // On the PL18EV PI.08 (BT_EN) switches BT_3V3 on the Bluetooth socket, high = on.
++  #if !defined(PL18EV_INTERNAL_CRSF) || defined(PL18EV_INTMODULE_PWR_PI8)
+   #define INTMODULE_PWR_GPIO              GPIO_PIN(GPIOI, 8)  // PI.08
++  #endif
+   #define INTMODULE_TX_GPIO               GPIO_PIN(GPIOB, 10) // PB.10
+   #define INTMODULE_RX_GPIO               GPIO_PIN(GPIOB, 11) // PB.11
+   #define INTMODULE_USART                 USART3
+diff --git a/radio/src/targets/pl18/touch_driver.cpp b/radio/src/targets/pl18/touch_driver.cpp
+index 2e72f83..330ff20 100644
+--- a/radio/src/targets/pl18/touch_driver.cpp
++++ b/radio/src/targets/pl18/touch_driver.cpp
+@@ -473,6 +473,13 @@ bool touchPanelInit()
+   return touchController != TC_NONE;
+ }
+ 
++bool mcTouchHasContact()
++{
++  if (!tcd) return false;
++  uint16_t x, y;
++  return tcd->touchRead(&x, &y);
++}
++
+ bool touchPanelEventOccured()
+ {
+   return tcd->hasTouchEvent();
+diff --git a/radio/src/targets/pl18/touch_driver.h b/radio/src/targets/pl18/touch_driver.h
+index 6b0fb01..1964068 100644
+--- a/radio/src/targets/pl18/touch_driver.h
++++ b/radio/src/targets/pl18/touch_driver.h
+@@ -28,4 +28,6 @@ extern bool touchPanelInit();
+ 
+ struct TouchState touchPanelRead();
+ bool touchPanelEventOccured();
++// MC: true if the controller reports a finger right now (direct I2C read)
++bool mcTouchHasContact();
+ struct TouchState getInternalTouchState();

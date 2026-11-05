@@ -1,0 +1,247 @@
+diff --git a/radio/src/targets/pl18/battery_driver.cpp b/radio/src/targets/pl18/battery_driver.cpp
+index de6def4..478056e 100644
+--- a/radio/src/targets/pl18/battery_driver.cpp
++++ b/radio/src/targets/pl18/battery_driver.cpp
+@@ -373,6 +373,199 @@ uint16_t get_wCharger_state(uint16_t state)
+   return state;
+ }
+ 
++#if defined(RADIO_PL18EV) && defined(MC_CUSTOM_BUILD)
++// ---------------------------------------------------------------------------
++// MC: charge state like FlySkyOS (PL18EV firmware 1.0.9, charger task that
++// runs every 100 ms):
++// - charge pin (PB13 / PI10): low = charging, high = charge end; a change
++//   counts after 10 equal samples (1 s)
++// - "full" only if the pin says so AND the battery voltage (5 samples
++//   without min/max) is >= 4.15 V; once full it stays full until the
++//   charger is removed. FlySkyOS shows "not charging" for USB if the pin
++//   says "end" below 4.15 V - on the PL18EV the pin is high while charging
++//   too, so this case is shown as charging (like FlySkyOS does for the
++//   wireless charger).
++// - the charger IC is enabled for 97 s, then switched off for 3 s (restarts
++//   the charge cycle); the charge pin is not evaluated during the pause
++// - only one charger is enabled: USB has priority, wireless is only
++//   checked without USB
++// - wireless charge current: high after 240 s on the pad, low again after
++//   60 s without
++// ---------------------------------------------------------------------------
++#define FS_STEP_MS          100
++#define FS_DEBOUNCE         10    // 1 s
++#define FS_RUN_STEPS        970   // 97 s charger on
++#define FS_PAUSE_STEPS      30    // 3 s charger off
++#define FS_FULL_VOLTAGE     415   // 4.15 V (10 mV)
++#define FS_WL_HIGH_STEPS    2400  // 240 s
++#define FS_WL_LOW_STEPS     600   // 60 s
++
++struct FsEnd {
++  bool full;     // charge pin says "end"
++  bool ready;    // pin state confirmed since the charger was enabled
++  uint8_t cntLow;
++  uint8_t cntHigh;
++};
++
++static FsEnd fsUsbEnd;
++static FsEnd fsWlEnd;
++static uint32_t fsLastStep = 0;
++static uint8_t fsRun = 0;         // 1 = charger enabled, 0 = off / pause
++static uint16_t fsRunCnt = FS_PAUSE_STEPS;
++static uint8_t fsState = 0;       // 0 = not charging, 1 = charging, 2 = full
++static uint16_t fsVolt[5];
++static uint8_t fsVoltIdx = 0;
++static uint8_t fsVoltCnt = 0;
++static uint16_t fsWlOn = 0;
++static uint16_t fsWlOff = 0;
++static bool fsWlHigh = false;
++static uint16_t fsResult = CHARGE_UNKNOWN;
++static bool fsAdcReady = false;  // ADC initialised (charge screen)
++
++static void fsEndReset(FsEnd& e)
++{
++  e.full = false;
++  e.ready = false;
++  e.cntLow = 0;
++  e.cntHigh = 0;
++}
++
++static void fsEndDetect(FsEnd& e, bool pinHigh)
++{
++  if (pinHigh) {
++    e.cntLow = 0;
++    if (e.full) {
++      if (!e.ready && ++e.cntHigh >= FS_DEBOUNCE) { e.cntHigh = 0; e.ready = true; }
++    } else if (++e.cntHigh >= FS_DEBOUNCE) {
++      e.cntHigh = 0;
++      e.full = true;
++      e.ready = true;
++    }
++  } else {
++    e.cntHigh = 0;
++    if (!e.full) {
++      if (!e.ready && ++e.cntLow >= FS_DEBOUNCE) { e.cntLow = 0; e.ready = true; }
++    } else if (++e.cntLow >= FS_DEBOUNCE) {
++      e.cntLow = 0;
++      e.full = false;
++      e.ready = true;
++    }
++  }
++}
++
++// average of 5 voltage samples without the highest and the lowest one
++static uint16_t fsVoltage()
++{
++  if (fsVoltCnt < 5) return 0;
++  uint32_t sum = 0;
++  uint16_t vmin = 0xFFFF, vmax = 0;
++  for (uint8_t i = 0; i < 5; i++) {
++    sum += fsVolt[i];
++    if (fsVolt[i] < vmin) vmin = fsVolt[i];
++    if (fsVolt[i] > vmax) vmax = fsVolt[i];
++  }
++  return (sum - vmin - vmax) / 3;
++}
++
++static void fsStep()
++{
++  bool usb = uCharger.isChargerDetectionReady && uCharger.hasCharger;
++  bool wl = !usb && wCharger.isChargerDetectionReady && wCharger.hasCharger;
++
++  // battery voltage (on the charge screen the ADC is read here; while the
++  // radio runs the mixer task keeps it up to date)
++  if (!mcRuntimeCharge && fsAdcReady) adcRead();
++  fsVolt[fsVoltIdx] = getBatteryVoltage();
++  fsVoltIdx = (fsVoltIdx + 1) % 5;
++  if (fsVoltCnt < 5) fsVoltCnt++;
++
++  // charge pin only while the charger is enabled
++  if (!usb || !fsRun) fsEndReset(fsUsbEnd);
++  else fsEndDetect(fsUsbEnd, gpio_read(UCHARGER_CHARGE_END_GPIO));
++  if (!wl || !fsRun) fsEndReset(fsWlEnd);
++  else fsEndDetect(fsWlEnd, gpio_read(WCHARGER_CHARGE_END_GPIO));
++
++  if (!usb && !wl) {
++    fsState = 0;
++  } else {
++    FsEnd& e = usb ? fsUsbEnd : fsWlEnd;
++    if (e.ready) {
++      if (e.full && fsVoltage() >= FS_FULL_VOLTAGE) {
++        fsState = 2;
++      } else if (fsState != 2) {
++        fsState = 1;
++      }
++    }
++  }
++
++  // enable cycle: 97 s on, 3 s off
++  if (usb || wl) {
++    if (fsRun) {
++      if (++fsRunCnt >= FS_RUN_STEPS) { fsRunCnt = 0; fsRun = 0; }
++    } else if (++fsRunCnt >= FS_PAUSE_STEPS) {
++      fsRunCnt = 0;
++      fsRun = 1;
++    }
++  } else {
++    fsRun = 0;
++    fsRunCnt = FS_PAUSE_STEPS;  // enable at once when a charger appears
++  }
++  if (fsRun && usb) {
++    gpio_set(UCHARGER_EN_GPIO);
++    gpio_clear(WCHARGER_EN_GPIO);
++  } else if (fsRun && wl) {
++    gpio_clear(UCHARGER_EN_GPIO);
++    gpio_set(WCHARGER_EN_GPIO);
++  } else {
++    gpio_clear(UCHARGER_EN_GPIO);
++    gpio_clear(WCHARGER_EN_GPIO);
++  }
++
++  // wireless charge current
++  if (wCharger.isChargerDetectionReady && wCharger.hasCharger && !usb) {
++    fsWlOff = 0;
++    if (fsWlOn < FS_WL_HIGH_STEPS) fsWlOn++;
++    else fsWlHigh = true;
++  } else if (fsWlHigh) {
++    if (++fsWlOff >= FS_WL_LOW_STEPS) { fsWlHigh = false; fsWlOn = 0; }
++  } else {
++    fsWlOn = 0;
++  }
++  if (fsWlHigh) gpio_set(WCHARGER_I_CONTROL_GPIO);
++  else gpio_clear(WCHARGER_I_CONTROL_GPIO);
++
++  if (!usb && !wl) {
++    fsResult = CHARGE_NONE;
++  } else if (fsState == 2) {
++    fsResult = CHARGE_FINISHED;
++  } else {
++    // charging, or pin not confirmed yet (just plugged in / pause)
++    fsResult = CHARGE_STARTED;
++  }
++}
++
++uint16_t get_battery_charge_state()
++{
++  // charger presence: every call (10 ms), 10 equal samples
++  chargerDetection(&uCharger, IS_UCHARGER_ACTIVE(), UCHARGER_SAMPLING_CNT);
++  if (uCharger.isChargerDetectionReady && uCharger.hasCharger) {
++    // with USB the wireless charger is not used
++    wCharger.hasCharger = false;
++    wCharger.isChargerDetectionReady = true;
++    wCharger.chargerSamplingCount = 0;
++  } else {
++    chargerDetection(&wCharger, IS_WCHARGER_ACTIVE(), WCHARGER_SAMPLING_CNT);
++  }
++
++  uint32_t now = timersGetMsTick();
++  if (fsLastStep == 0 || (uint32_t)(now - fsLastStep) >= FS_STEP_MS) {
++    fsLastStep = now ? now : 1;
++    fsStep();
++  }
++
++  return fsResult;
++}
++#else
+ uint16_t get_battery_charge_state()
+ {
+   uint16_t state = CHARGE_UNKNOWN;
+@@ -389,6 +582,8 @@ uint16_t get_battery_charge_state()
+   return state;
+ }
+ 
++#endif
++
+ bool isChargerActive()
+ {
+   mcRuntimeCharge = false;  // MC: avoid concurrent polling from per10ms()  
+@@ -430,7 +625,8 @@ void battery_charge_init()
+ #endif
+ 
+   // USB charger state init
+-#if defined(RADIO_PL18U)  
++#if defined(RADIO_PL18U) || (defined(RADIO_PL18EV) && defined(MC_CUSTOM_BUILD))
++  // MC (PL18EV): like FlySkyOS the chargers are enabled once detected
+   DISABLE_UCHARGER();
+ #else
+   ENABLE_UCHARGER();
+@@ -450,8 +646,13 @@ void battery_charge_init()
+ #endif  // defined(WCHARGER_I_CONTROL_GPIO)
+ 
+   // Wireless charger state init
++#if defined(RADIO_PL18EV) && defined(MC_CUSTOM_BUILD)
++  DISABLE_WCHARGER();
++  gpio_clear(WCHARGER_I_CONTROL_GPIO);  // FlySkyOS: low = low current
++#else
+   ENABLE_WCHARGER();
+   WCHARGER_CURRENT_LOW();
++#endif
+   wCharger.hasCharger = IS_WCHARGER_ACTIVE();
+   wCharger.isChargerDetectionReady = false;
+   wCharger.stableSamplingCount = 0;
+@@ -492,6 +693,9 @@ static void mcStoreBattSettings()
+ // when the SD card is read)
+ void mcLoadBattSettings()
+ {
++#if defined(RADIO_PL18EV)
++  fsAdcReady = true;  // called right after adcInit()
++#endif
+   __HAL_RCC_PWR_CLK_ENABLE();
+   HAL_PWR_EnableBkUpAccess();
+   uint32_t v = MC_BKP_REG;
