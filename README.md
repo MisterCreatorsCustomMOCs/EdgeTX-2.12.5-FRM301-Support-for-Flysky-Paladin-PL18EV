@@ -199,6 +199,10 @@ You can then use EXT3 and EXT4 as a source anywhere in EdgeTX, e.g. in mixes or 
 ### 6. Charging
 
 ![USB charging shown in the top bar](images/usb_charging_detection.png)
+<p>
+  <img src="images/usb_charging_detection.png" alt="EdgeTX top bar charge detection" width="50%">
+  <img src="images/charging.jpg" alt="Standby Display Charging animation" width="50%">
+</p>
 
 - **Radio switched on:** the radio charges and shows it in the top bar: the **USB symbol** and
   the **battery with a charging flash**.
