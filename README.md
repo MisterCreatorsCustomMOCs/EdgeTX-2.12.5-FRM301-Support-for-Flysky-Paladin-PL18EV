@@ -92,7 +92,7 @@ Under *Radio Setup → About EdgeTX* (the **i** tab) you now see
 **"VERS: MC 1.2 (based on EdgeTX 2.12.5)"** and **"BUILD: MisterCreators Custom MOCs"**.
 
 ### Alternative: EdgeTX bootloader (no PC driver needed)
-**WARNING:** this methode is known to bug sometimes, which causes the radio **[not starting after flashing]([https://eff.org](https://github.com/EdgeTX/edgetx/issues/7726))** (blackscreen), therefore flashing with edgeTX Buddy is recommended!!!
+**WARNING:** this methode is known to bug sometimes, which causes the radio **[not starting after flashing](https://github.com/EdgeTX/edgetx/issues/7726)** (blackscreen), therefore flashing with edgeTX Buddy is recommended!!!
 
 1. Copy the `.bin` file into the folder `FIRMWARE` on the SD card / internal storage.
 2. Switch the radio off.
