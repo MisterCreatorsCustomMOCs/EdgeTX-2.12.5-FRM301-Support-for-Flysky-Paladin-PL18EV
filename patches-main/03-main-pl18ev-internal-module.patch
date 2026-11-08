@@ -1,0 +1,91 @@
+From 4a8ce63d091ac0134bbba8a44e82a3c15e268494 Mon Sep 17 00:00:00 2001
+From: MisterCreator <mr.creator.gta5@gmail.com>
+Date: Thu, 5 Nov 2026 22:13:19 +0100
+Subject: [PATCH] feat(pl18ev): optional internal module on the Bluetooth port
+
+New build option PL18EV_INTERNAL_CRSF: an internal CRSF (ELRS) or Multi
+module connected to the Bluetooth pads (USART3, PB.10/PB.11) instead of
+the Bluetooth board. CRSF is the default internal module.
+
+PL18EV_INTMODULE_PWR_PI8 (default ON) switches the module power via
+BT_EN (PI.08, high = on), which also allows flashing a Multi module from
+the radio. UART7 stays untouched.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JtPRHfcjthyC8ptCnBrhPD
+---
+ radio/src/targets/pl18/CMakeLists.txt | 18 ++++++++++++++++++
+ radio/src/targets/pl18/board.h        |  8 ++++++++
+ radio/src/targets/pl18/hal.h          |  7 ++++++-
+ 3 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/radio/src/targets/pl18/CMakeLists.txt b/radio/src/targets/pl18/CMakeLists.txt
+index afa46e85a..5bded940d 100644
+--- a/radio/src/targets/pl18/CMakeLists.txt
++++ b/radio/src/targets/pl18/CMakeLists.txt
+@@ -97,6 +97,24 @@ elseif(PCBREV STREQUAL PL18EV)
+   set(LED_STRIP ON)
+   set(AFHDS3 ON)
+   set(KEY_DRIVER key_driver.cpp)
++
++  # Optional internal module on the Bluetooth pads (USART3 on PB.10/PB.11 =
++  # TX_BLE/RX_BLE), e.g. a CRSF (ELRS) or Multi module instead of the
++  # Bluetooth board. UART7 (PF.06/PF.07) is left untouched.
++  option(PL18EV_INTERNAL_CRSF "Internal CRSF/Multi module on the Bluetooth pads (USART3)" OFF)
++  if(PL18EV_INTERNAL_CRSF)
++    add_definitions(-DPL18EV_INTERNAL_CRSF)
++    set(INTERNAL_MODULES CRSF;MULTI CACHE STRING "Internal modules")
++    set(DEFAULT_INTERNAL_MODULE CROSSFIRE CACHE STRING "Default internal module")
++
++    # Power switching of the internal module via BT_EN (PI.08), high = on.
++    # PI.08 switches BT_3V3 on the Bluetooth socket. Also needed for
++    # flashing a Multi module from the radio.
++    option(PL18EV_INTMODULE_PWR_PI8 "Switch internal module power via PI.08 (BT_EN)" ON)
++    if(PL18EV_INTMODULE_PWR_PI8)
++      add_definitions(-DPL18EV_INTMODULE_PWR_PI8)
++    endif()
++  endif()
+ else()
+   set(FLAVOUR pl18)
+   add_definitions(-DUSE_HATS_AS_KEYS)
+diff --git a/radio/src/targets/pl18/board.h b/radio/src/targets/pl18/board.h
+index 510d7dd60..4671791ab 100644
+--- a/radio/src/targets/pl18/board.h
++++ b/radio/src/targets/pl18/board.h
+@@ -92,6 +92,14 @@ extern "C" void SDRAM_Init();
+     else                                        \
+       gpio_set(INTMODULE_PWR_GPIO);             \
+   } while (0)
++#elif defined(PL18EV_INTERNAL_CRSF) && defined(PL18EV_INTMODULE_PWR_PI8)
++  // internal module on the Bluetooth port, power switched via PI.08 (high = on)
++  #define INTERNAL_MODULE_ON()            gpio_set(INTMODULE_PWR_GPIO)
++  #define INTERNAL_MODULE_OFF()           gpio_clear(INTMODULE_PWR_GPIO)
++#elif defined(PL18EV_INTERNAL_CRSF)
++  // internal module on the Bluetooth port: no power switching
++  #define INTERNAL_MODULE_ON()
++  #define INTERNAL_MODULE_OFF()
+ #elif defined(RADIO_NB4P) || defined(RADIO_PL18U)
+   #define INTERNAL_MODULE_ON()            gpio_clear(INTMODULE_PWR_GPIO)
+   #define INTERNAL_MODULE_OFF()           gpio_set(INTMODULE_PWR_GPIO);
+diff --git a/radio/src/targets/pl18/hal.h b/radio/src/targets/pl18/hal.h
+index 1975f598b..95452002b 100644
+--- a/radio/src/targets/pl18/hal.h
++++ b/radio/src/targets/pl18/hal.h
+@@ -357,8 +357,13 @@
+   #define INTMODULE_TIMER_IRQn            TIM3_IRQn
+   #define INTMODULE_TIMER_IRQHandler      TIM3_IRQHandler
+   #define INTMODULE_TIMER_FREQ            (PERI1_FREQUENCY * TIMER_MULT_APB1)
+-#elif defined(RADIO_NB4P)
++#elif defined(RADIO_NB4P) || defined(PL18EV_INTERNAL_CRSF)
++  // NB4P internal module / PL18EV internal module on the Bluetooth port
++  // (TX3/RX3). On the PL18EV PI.08 (BT_EN) switches BT_3V3 on the Bluetooth
++  // socket, high = on.
++  #if !defined(PL18EV_INTERNAL_CRSF) || defined(PL18EV_INTMODULE_PWR_PI8)
+   #define INTMODULE_PWR_GPIO              GPIO_PIN(GPIOI, 8)  // PI.08
++  #endif
+   #define INTMODULE_TX_GPIO               GPIO_PIN(GPIOB, 10) // PB.10
+   #define INTMODULE_RX_GPIO               GPIO_PIN(GPIOB, 11) // PB.11
+   #define INTMODULE_USART                 USART3
+-- 
+2.43.0
+
